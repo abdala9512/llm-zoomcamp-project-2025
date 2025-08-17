@@ -2,7 +2,16 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.DS_Store
+.vscode/
+*.pdf
 
+.terraform/
+.terraform.lock.hcl
+*terraform.tfstate
+*terraform.tfstate.backup
+
+qdrant_storage/
 # C extensions
 *.so
 

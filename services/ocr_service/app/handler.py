@@ -1,23 +1,31 @@
-# services/ocr_service/app/handler.py
 import os, json, hashlib, tempfile, datetime, re
+from pathlib import Path
 import boto3
 
-from docling.document_converter import DocumentConverter, PdfFormatOption, InputFormat
+from docling.document_converter import DocumentConverter
 from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
-from docling_core.types.doc import ImageRefMode  # may be unused if your version lacks PLACEHOLDER
 
 s3 = boto3.client("s3")
+
 OUT_BUCKET = os.environ.get("OUT_BUCKET")
 ENABLE_OCR = os.environ.get("ENABLE_OCR", "auto")  # "auto" | "always" | "never"
 OCR_MODELS_DIR = os.environ.get("OCR_MODELS_DIR", "/opt/models/rapidocr")
 
+
 def _sha256_bytes(b: bytes) -> str:
-    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
 
 def _should_do_ocr(_obj_bytes: bytes) -> bool:
-    if ENABLE_OCR == "always": return True
-    if ENABLE_OCR == "never":  return False
-    return True  # "auto": let pipeline use OCR when needed
+    # Keep the simple switch; "auto" defers to pipeline heuristics.
+    if ENABLE_OCR == "always":
+        return True
+    if ENABLE_OCR == "never":
+        return False
+    return True  # "auto"
+
 
 def _front_matter(meta: dict) -> str:
     lines = ["---"]
@@ -28,14 +36,17 @@ def _front_matter(meta: dict) -> str:
     lines.append("---\n")
     return "\n".join(lines)
 
+
 def lambda_handler(event, context):
+    # S3 event: may contain multiple records
     for rec in event.get("Records", []):
         bkt = rec["s3"]["bucket"]["name"]
         key = rec["s3"]["object"]["key"]
+
         if not key.lower().endswith(".pdf"):
             continue
 
-        # Download PDF
+        # Fetch PDF
         obj = s3.get_object(Bucket=bkt, Key=key)
         pdf_bytes = obj["Body"].read()
         digest = _sha256_bytes(pdf_bytes)
@@ -48,12 +59,11 @@ def lambda_handler(event, context):
             with open(pdf_path, "wb") as f:
                 f.write(pdf_bytes)
 
-            # Docling pipeline
+            # ---- Docling v2 pipeline configuration ----
             pipe = PdfPipelineOptions()
             pipe.do_ocr = _should_do_ocr(pdf_bytes)
 
-            # RapidOCR paths (pre-bundled)
-            from pathlib import Path
+            # RapidOCR ONNX model paths (baked into the image)
             det = Path(OCR_MODELS_DIR) / "PP-OCRv4" / "en_PP-OCRv3_det_infer.onnx"
             recp = Path(OCR_MODELS_DIR) / "PP-OCRv4" / "ch_PP-OCRv4_rec_server_infer.onnx"
             cls = Path(OCR_MODELS_DIR) / "PP-OCRv3" / "ch_ppocr_mobile_v2.0_cls_train.onnx"
@@ -63,26 +73,18 @@ def lambda_handler(event, context):
                 cls_model_path=str(cls),
             )
 
-            # Explicitly disable image generation
+            # We only want Markdown text—disable image generation
             pipe.generate_page_images = False
             pipe.generate_picture_images = False
 
-            converter = DocumentConverter(format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipe)
-            })
-
+            converter = DocumentConverter(pipeline_options=pipe)
             conv = converter.convert(pdf_path)
 
-            # Save Markdown (no images)
+            # ---- Save Markdown (no images) ----
             out_dir = os.path.join(tmpd, "out")
             os.makedirs(out_dir, exist_ok=True)
             md_path = os.path.join(out_dir, "doc.md")
-
-            # Some Docling versions support placeholders; otherwise omit image_mode
-            try:
-                conv.document.save_as_markdown(md_path, image_mode=ImageRefMode.PLACEHOLDER)
-            except Exception:
-                conv.document.save_as_markdown(md_path)
+            conv.document.save_as_markdown(md_path)
 
             title = conv.document.title or os.path.basename(key)
             meta = {
@@ -92,12 +94,13 @@ def lambda_handler(event, context):
                 "sha256": digest,
                 "pages": len(conv.document.pages),
                 "converted_at": datetime.datetime.utcnow().isoformat() + "Z",
-                "docling_version": "runtime",
+                "docling_version": "v2",
                 "ocr": pipe.do_ocr,
             }
 
             body = open(md_path, "r", encoding="utf-8").read()
             fm = _front_matter(meta) + body
+
             s3.put_object(
                 Bucket=OUT_BUCKET,
                 Key=out_md_key,

@@ -1,16 +1,31 @@
-# services/ocr-pdf2md/Dockerfile
+# Use the AWS Lambda Python base (AL2023)
 FROM public.ecr.aws/lambda/python:3.12
 
-# Python deps (pin torch CPU build you validated)
-RUN python -m pip install --no-cache-dir \
-    "torch==2.2.2" \
-    "docling>=1.16.0,<2.0" \
-    "onnxruntime>=1.17.0" \
-    rapidocr-onnxruntime \
-    huggingface_hub \
-    boto3
+# ---- System libs (native deps for onnxruntime/torch/Pillow) ----
+RUN dnf install -y \
+      libgomp \
+      libstdc++ \
+      zlib \
+      libjpeg-turbo \
+      libpng \
+      freetype \
+  && dnf clean all
 
-# Cache RapidOCR models at build time (no runtime downloads)
+# ---- Python deps (Docling v2 + headless OpenCV to avoid libGL) ----
+# numpy<2 keeps ABI friction low with current wheels
+RUN python -m pip install --no-cache-dir --upgrade pip \
+ && python -m pip install --no-cache-dir \
+      "numpy==1.26.4" \
+      "onnxruntime==1.17.1" \
+      "torch==2.2.2" \
+      "opencv-python-headless<5" \
+      "docling>=2.0.0,<3.0.0" \
+      rapidocr-onnxruntime \
+      huggingface_hub \
+      boto3 \
+      pillow
+
+# ---- Cache RapidOCR ONNX models in the image (no runtime downloads) ----
 RUN python - <<'PY'
 from huggingface_hub import snapshot_download
 snapshot_download(
@@ -18,16 +33,23 @@ snapshot_download(
     local_dir="/opt/models/rapidocr",
     local_dir_use_symlinks=False
 )
-print("RapidOCR models cached.")
+print("RapidOCR models cached at /opt/models/rapidocr")
 PY
 
-# Copy function code
-COPY app /var/task/app
+# ---- Build-time smoke checks (fail early if imports break) ----
+RUN python - <<'PY'
+import docling
+from docling.document_converter import DocumentConverter
+from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
+print("Docling version:", getattr(docling, "__version__", "unknown"))
+print("Imports OK:", DocumentConverter, PdfPipelineOptions, RapidOcrOptions)
+PY
 
-# Runtime env
+# ---- App code & runtime env ----
+COPY app /var/task/app
 ENV OCR_MODELS_DIR=/opt/models/rapidocr
 ENV DOCLING_CACHE_DIR=/tmp/docling_cache
 ENV PYTHONUNBUFFERED=1
 
-# Lambda handler (module.submodule.function)
+# Lambda entrypoint: module.function
 CMD ["app.handler.lambda_handler"]

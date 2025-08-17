@@ -140,12 +140,22 @@ resource "aws_iam_role_policy_attachment" "attach" {
 # Lambda function (container image)
 # -----------------------
 
+data "aws_ecr_image" "lambda_image" {
+  repository_name = aws_ecr_repository.repo.name
+  image_tag       = var.image_tag
+  registry_id     = aws_ecr_repository.repo.registry_id
+
+  # If your build produced a Docker v2 manifest, this is fine.
+  # If it's OCI, Lambda also accepts it — using a digest avoids media-type ambiguity.
+}
+
 resource "aws_lambda_function" "fn" {
   function_name = local.name
   role          = aws_iam_role.lambda.arn
 
   package_type = "Image"
-  image_uri    = "${aws_ecr_repository.repo.repository_url}:${var.image_tag}"
+  image_uri    = "${aws_ecr_repository.repo.repository_url}@${data.aws_ecr_image.lambda_image.image_digest}"
+
 
   timeout       = var.timeout_s
   memory_size   = var.memory_mb
